@@ -1,0 +1,52 @@
+name: 🔄 Sync Drive to Voiceflow
+
+# When to run the automation
+on:
+  # Scheduled runs (every 6 hours)
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours at minute 0
+  
+  # Allow manual triggering from Actions tab
+  workflow_dispatch:
+  
+  # Run on push to main branch (for testing)
+  push:
+    branches: [ main ]
+
+jobs:
+  sync:
+    name: Sync Files
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📥 Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: 🟢 Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: 📦 Install Dependencies
+      run: npm install
+    
+    - name: 🔄 Run Sync Process
+      env:
+        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        VOICEFLOW_API_KEY: ${{ secrets.VOICEFLOW_API_KEY }}
+      run: |
+        echo "Starting sync process..."
+        npm start
+        echo "Sync process completed!"
+    
+    - name: 📝 Upload Logs (on failure)
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: sync-logs
+        path: |
+          *.log
+          /tmp/*.log
+        retention-days: 7
