@@ -1,0 +1,14 @@
+{
+  "name": "drive-voiceflow-sync",
+  "version": "1.0.0",
+  "description": "Automated sync from Google Drive to Voiceflow Knowledge Base",
+  "main": "sync.js",
+  "scripts": {
+    "start": "node sync.js"
+  },
+  "dependencies": {
+    "googleapis": "^128.0.0",
+    "axios": "^1.5.0",
+    "form-data": "^4.0.0"
+  }
+}
