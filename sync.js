@@ -33,7 +33,14 @@ class DriveToVoiceflowSync {
 
   async getFilesFromDrive() {
     try {
-      console.log('🔍 Fetching files from Google Drive...');
+      console.log('🔍 Fetching recent files from Google Drive...');
+      
+      // Calculate 6 hours ago
+      const sixHoursAgo = new Date();
+      sixHoursAgo.setHours(sixHoursAgo.getHours() - 6);
+      const isoTime = sixHoursAgo.toISOString();
+      
+      console.log(`📅 Looking for files modified after: ${isoTime}`);
       
       let allFiles = [];
       let pageToken = null;
@@ -41,7 +48,7 @@ class DriveToVoiceflowSync {
       
       do {
         const params = {
-          q: `'${this.config.googleDriveFolderId}' in parents and trashed=false`,
+          q: `'${this.config.googleDriveFolderId}' in parents and trashed=false and modifiedTime > '${isoTime}'`,
           fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, size)',
           orderBy: 'modifiedTime desc',
           pageSize: 100
@@ -58,21 +65,24 @@ class DriveToVoiceflowSync {
         pageToken = response.data.nextPageToken;
         pageCount++;
         
-        console.log(`📄 Page ${pageCount}: Found ${files.length} files (Total so far: ${allFiles.length})`);
+        console.log(`📄 Page ${pageCount}: Found ${files.length} recent files (Total so far: ${allFiles.length})`);
         
       } while (pageToken);
 
-      console.log(`📁 Total files found in Google Drive folder: ${allFiles.length}`);
+      console.log(`📁 Total recent files found: ${allFiles.length}`);
       
-      // Log sample files for debugging
+      // Log sample files with modification dates
       if (allFiles.length > 0) {
-        console.log(`📋 Sample files:`);
+        console.log(`📋 Recent files:`);
         allFiles.slice(0, 5).forEach((file, index) => {
-          console.log(`  ${index + 1}. ${file.name} (${file.mimeType})`);
+          const modifiedTime = new Date(file.modifiedTime);
+          console.log(`  ${index + 1}. ${file.name} (${modifiedTime.toLocaleString()})`);
         });
         if (allFiles.length > 5) {
-          console.log(`  ... and ${allFiles.length - 5} more files`);
+          console.log(`  ... and ${allFiles.length - 5} more recent files`);
         }
+      } else {
+        console.log(`📭 No files have been modified in the last 6 hours`);
       }
       
       return allFiles;
@@ -207,8 +217,29 @@ class DriveToVoiceflowSync {
   }
 
   shouldUploadFile(fileName, driveModifiedTime, existingFiles) {
-    const normalizedFileName = fileName.toLowerCase();
-    const existingFile = existingFiles.get(normalizedFileName);
+    // Try multiple variations of the filename for matching
+    const variations = [
+      fileName.toLowerCase(),
+      this.sanitizeFilename(fileName).toLowerCase(),
+      fileName.replace(/['"]/g, '').toLowerCase(), // Remove quotes
+      fileName.replace(/\s*\([^)]*\)\s*/g, '').toLowerCase(), // Remove parentheses content
+      fileName.replace(/\s*\[[^\]]*\]\s*/g, '').toLowerCase()  // Remove bracket content
+    ];
+    
+    console.log(`🔍 Checking variations for: ${fileName}`);
+    variations.forEach((variation, index) => {
+      console.log(`   ${index + 1}. "${variation}"`);
+    });
+    
+    // Check if any variation exists in Voiceflow
+    let existingFile = null;
+    for (const variation of variations) {
+      if (existingFiles.has(variation)) {
+        existingFile = existingFiles.get(variation);
+        console.log(`📝 Found match with variation: "${variation}"`);
+        break;
+      }
+    }
     
     if (!existingFile) {
       console.log(`✨ New file: ${fileName}`);
@@ -216,23 +247,36 @@ class DriveToVoiceflowSync {
     }
     
     // Check if Drive file is newer than Voiceflow file
-    const driveTime = new Date(driveModifiedTime);
-    const voiceflowTime = new Date(existingFile.updatedAt);
-    
-    if (driveTime > voiceflowTime) {
-      console.log(`🔄 File updated since last sync: ${fileName}`);
-      console.log(`   Drive: ${driveTime.toISOString()}`);
-      console.log(`   Voiceflow: ${voiceflowTime.toISOString()}`);
-      return true;
+    if (driveModifiedTime && existingFile.updatedAt) {
+      const driveTime = new Date(driveModifiedTime);
+      const voiceflowTime = new Date(existingFile.updatedAt);
+      
+      if (driveTime > voiceflowTime) {
+        console.log(`🔄 File updated since last sync: ${fileName}`);
+        console.log(`   Drive: ${driveTime.toISOString()}`);
+        console.log(`   Voiceflow: ${voiceflowTime.toISOString()}`);
+        return true;
+      }
     }
     
     console.log(`⏭️ File already up-to-date: ${fileName}`);
     return false;
   }
 
+  sanitizeFilename(filename) {
+    // Remove or replace problematic characters in filenames
+    return filename
+      .replace(/[<>:"/\\|?*]/g, '-') // Replace invalid characters with dash
+      .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+      .replace(/^\s+|\s+$/g, '') // Trim spaces from start/end
+      .substring(0, 200); // Limit filename length
+  }
+
   async uploadToVoiceflow(fileData, originalFile) {
     try {
-      console.log(`📤 Uploading to Voiceflow: ${fileData.fileName}`);
+      // Sanitize filename for better compatibility
+      const sanitizedFilename = this.sanitizeFilename(fileData.fileName);
+      console.log(`📤 Uploading to Voiceflow: ${sanitizedFilename}`);
       
       const formData = new FormData();
       
@@ -249,13 +293,20 @@ class DriveToVoiceflowSync {
         throw new Error('File content is empty or invalid');
       }
       
+      // Check file size (Voiceflow might have limits)
+      const maxSize = 50 * 1024 * 1024; // 50MB limit
+      if (buffer.length > maxSize) {
+        console.log(`⚠️ File too large (${buffer.length} bytes), skipping: ${sanitizedFilename}`);
+        return { error: 'File too large', skipped: true };
+      }
+      
       formData.append('file', buffer, {
-        filename: fileData.fileName,
-        contentType: this.getVoiceflowMimeType(fileData.fileName, fileData.originalMimeType)
+        filename: sanitizedFilename,
+        contentType: this.getVoiceflowMimeType(sanitizedFilename, fileData.originalMimeType)
       });
 
       console.log(`📊 File size: ${buffer.length} bytes`);
-      console.log(`📝 Content type: ${this.getVoiceflowMimeType(fileData.fileName, fileData.originalMimeType)}`);
+      console.log(`📝 Content type: ${this.getVoiceflowMimeType(sanitizedFilename, fileData.originalMimeType)}`);
 
       const response = await axios.post(
         `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs`,
@@ -267,19 +318,71 @@ class DriveToVoiceflowSync {
           },
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
-          timeout: 60000 // 60 second timeout
+          timeout: 120000, // Increased timeout to 2 minutes
+          validateStatus: function (status) {
+            return status < 500; // Don't throw for 4xx errors, only 5xx
+          }
         }
       );
 
-      console.log(`✅ Successfully uploaded to Voiceflow: ${fileData.fileName}`);
-      console.log(`   Document ID: ${response.data.documentID || 'N/A'}`);
+      if (response.status >= 400) {
+        console.error(`❌ HTTP ${response.status} error uploading ${sanitizedFilename}`);
+        console.error(`   Response: ${JSON.stringify(response.data)}`);
+        return null;
+      }
+
+      console.log(`✅ Successfully uploaded to Voiceflow: ${sanitizedFilename}`);
+      console.log(`   Document ID: ${response.data.documentID || response.data.id || 'N/A'}`);
       
       return response.data;
     } catch (error) {
       console.error(`❌ Error uploading ${fileData.fileName} to Voiceflow:`);
-      if (error.response) {
+      
+      if (error.code === 'ECONNABORTED') {
+        console.error('   Error: Request timeout - file may be too large or connection is slow');
+      } else if (error.response) {
         console.error(`   Status: ${error.response.status}`);
-        console.error(`   Message: ${JSON.stringify(error.response.data)}`);
+        
+        // Better error message parsing
+        let errorMessage = 'Unknown error';
+        if (typeof error.response.data === 'string') {
+          if (error.response.data.includes('Internal Server Error')) {
+            errorMessage = 'Voiceflow internal server error - this may be temporary';
+          } else {
+            errorMessage = error.response.data.substring(0, 200);
+          }
+        } else if (error.response.data && error.response.data.message) {
+          errorMessage = error.response.data.message;
+        }
+        
+        console.error(`   Message: ${errorMessage}`);
+        
+        // Specific handling for 500 errors
+        if (error.response.status === 500) {
+          console.log(`🔄 Retrying upload for ${fileData.fileName} in 5 seconds...`);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          
+          // Single retry attempt
+          try {
+            const retryResponse = await axios.post(
+              `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs`,
+              formData,
+              {
+                headers: {
+                  'Authorization': `Bearer ${this.config.voiceflowApiKey}`,
+                  ...formData.getHeaders()
+                },
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity,
+                timeout: 120000
+              }
+            );
+            console.log(`✅ Retry successful for: ${fileData.fileName}`);
+            return retryResponse.data;
+          } catch (retryError) {
+            console.error(`❌ Retry also failed for ${fileData.fileName}`);
+          }
+        }
       } else {
         console.error(`   Error: ${error.message}`);
       }
@@ -319,50 +422,34 @@ class DriveToVoiceflowSync {
   }
 
   async sync() {
-    console.log('🚀 Starting Google Drive to Voiceflow sync...');
+    console.log('🚀 Starting Google Drive to Voiceflow sync (Recent Files Only)...');
     console.log(`📅 Sync started at: ${new Date().toISOString()}`);
     
     try {
       // Initialize Google Drive
       await this.initializeDrive();
       
-      // Get existing files from Voiceflow (for duplicate checking)
-      const existingFiles = await this.getExistingVoiceflowFiles();
-      
-      // Get files from Drive
+      // Get recent files from Drive (modified in last 6 hours)
       const files = await this.getFilesFromDrive();
       
       if (files.length === 0) {
-        console.log('📭 No files found in the specified folder');
+        console.log('📭 No recent files found - nothing to sync');
         return;
       }
 
       let processedCount = 0;
       let skippedCount = 0;
       let errorCount = 0;
-      let duplicateCount = 0;
 
-      // Process each file
+      // Process each recent file
       for (const file of files) {
-        console.log(`\n🔄 Processing: ${file.name}`);
+        console.log(`\n🔄 Processing recent file: ${file.name}`);
+        console.log(`📅 Modified: ${new Date(file.modifiedTime).toLocaleString()}`);
         
         // Check if file type is supported
         if (!this.isFileSupported(file.mimeType)) {
           console.log(`⚠️  Skipping unsupported file type: ${file.mimeType}`);
           skippedCount++;
-          continue;
-        }
-
-        // Determine the final filename (after export if needed)
-        let finalFileName = file.name;
-        if (this.isGoogleWorkspaceFile(file.mimeType)) {
-          const exportFormat = this.getExportFormat(file.mimeType);
-          finalFileName = `${file.name}.${exportFormat.extension}`;
-        }
-
-        // Check if we need to upload this file
-        if (!this.shouldUploadFile(finalFileName, file.modifiedTime, existingFiles)) {
-          duplicateCount++;
           continue;
         }
 
@@ -376,7 +463,11 @@ class DriveToVoiceflowSync {
         // Upload to Voiceflow
         const result = await this.uploadToVoiceflow(fileData, file);
         if (result) {
-          processedCount++;
+          if (result.skipped) {
+            skippedCount++;
+          } else {
+            processedCount++;
+          }
         } else {
           errorCount++;
         }
@@ -386,11 +477,10 @@ class DriveToVoiceflowSync {
       }
 
       // Final summary
-      console.log('\n🎉 Sync completed!');
+      console.log('\n🎉 Recent files sync completed!');
       console.log(`📊 Summary:`);
       console.log(`   ✅ Processed: ${processedCount} files`);
-      console.log(`   ⏭️ Already up-to-date: ${duplicateCount} files`);
-      console.log(`   ⚠️  Skipped (unsupported): ${skippedCount} files`);
+      console.log(`   ⚠️  Skipped (unsupported/too large): ${skippedCount} files`);
       console.log(`   ❌ Errors: ${errorCount} files`);
       console.log(`📅 Sync finished at: ${new Date().toISOString()}`);
       
