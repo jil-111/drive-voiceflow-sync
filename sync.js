@@ -33,14 +33,7 @@ class DriveToVoiceflowSync {
 
   async getFilesFromDrive() {
     try {
-      console.log('🔍 Fetching recent files from Google Drive...');
-      
-      // Calculate 6 hours ago
-      const sixHoursAgo = new Date();
-      sixHoursAgo.setHours(sixHoursAgo.getHours() - 6);
-      const isoTime = sixHoursAgo.toISOString();
-      
-      console.log(`📅 Looking for files modified after: ${isoTime}`);
+      console.log('📁 Fetching all supported files from Google Drive...');
       
       let allFiles = [];
       let pageToken = null;
@@ -48,7 +41,7 @@ class DriveToVoiceflowSync {
       
       do {
         const params = {
-          q: `'${this.config.googleDriveFolderId}' in parents and trashed=false and modifiedTime > '${isoTime}'`,
+          q: `'${this.config.googleDriveFolderId}' in parents and trashed=false`,
           fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, size)',
           orderBy: 'modifiedTime desc',
           pageSize: 100
@@ -65,27 +58,17 @@ class DriveToVoiceflowSync {
         pageToken = response.data.nextPageToken;
         pageCount++;
         
-        console.log(`📄 Page ${pageCount}: Found ${files.length} recent files (Total so far: ${allFiles.length})`);
+        console.log(`📄 Page ${pageCount}: Found ${files.length} files (Total so far: ${allFiles.length})`);
         
       } while (pageToken);
 
-      console.log(`📁 Total recent files found: ${allFiles.length}`);
+      console.log(`📁 Total files found in Google Drive folder: ${allFiles.length}`);
       
-      // Log sample files with modification dates
-      if (allFiles.length > 0) {
-        console.log(`📋 Recent files:`);
-        allFiles.slice(0, 5).forEach((file, index) => {
-          const modifiedTime = new Date(file.modifiedTime);
-          console.log(`  ${index + 1}. ${file.name} (${modifiedTime.toLocaleString()})`);
-        });
-        if (allFiles.length > 5) {
-          console.log(`  ... and ${allFiles.length - 5} more recent files`);
-        }
-      } else {
-        console.log(`📭 No files have been modified in the last 6 hours`);
-      }
+      // Filter only supported file types
+      const supportedFiles = allFiles.filter(file => this.isFileSupported(file.mimeType));
+      console.log(`📋 Supported files: ${supportedFiles.length} of ${allFiles.length}`);
       
-      return allFiles;
+      return supportedFiles;
     } catch (error) {
       console.error('❌ Error fetching files from Google Drive:', error.message);
       return [];
@@ -98,36 +81,61 @@ class DriveToVoiceflowSync {
       
       let response;
       let exportedFileName = fileName;
+      let finalMimeType = mimeType;
       
       // Check if it's a Google Workspace file that needs to be exported
       if (this.isGoogleWorkspaceFile(mimeType)) {
         const exportFormat = this.getExportFormat(mimeType);
-        const exportMimeType = exportFormat.mimeType;
+        finalMimeType = exportFormat.mimeType;
         exportedFileName = `${fileName}.${exportFormat.extension}`;
         
         console.log(`📤 Exporting Google Workspace file: ${fileName} → ${exportedFileName}`);
         
-        response = await this.drive.files.export({
-          fileId: fileId,
-          mimeType: exportMimeType
-        }, { responseType: 'arraybuffer' }); // Explicitly request arraybuffer
+        try {
+          response = await this.drive.files.export({
+            fileId: fileId,
+            mimeType: finalMimeType
+          }, { responseType: 'arraybuffer' });
+        } catch (exportError) {
+          // If export fails due to size limit, try plain text fallback
+          if (exportError.message?.includes('exportSizeLimitExceeded') || 
+              exportError.response?.status === 403) {
+            console.log(`⚠️ Export failed due to size limit. Trying plain text fallback...`);
+            
+            try {
+              response = await this.drive.files.export({
+                fileId: fileId,
+                mimeType: 'text/plain'
+              }, { responseType: 'arraybuffer' });
+              
+              finalMimeType = 'text/plain';
+              exportedFileName = `${fileName}.txt`;
+              console.log(`📝 Fallback successful: ${exportedFileName}`);
+            } catch (fallbackError) {
+              console.error(`❌ Both export and fallback failed: ${fallbackError.message}`);
+              return null;
+            }
+          } else {
+            throw exportError;
+          }
+        }
         
       } else {
         // Regular file download
         response = await this.drive.files.get({
           fileId: fileId,
           alt: 'media'
-        }, { responseType: 'arraybuffer' }); // Explicitly request arraybuffer
+        }, { responseType: 'arraybuffer' });
+        finalMimeType = mimeType;
       }
 
-      // Convert to Buffer if needed
+      // Convert to Buffer
       let fileBuffer;
       if (Buffer.isBuffer(response.data)) {
         fileBuffer = response.data;
       } else if (response.data instanceof ArrayBuffer) {
         fileBuffer = Buffer.from(response.data);
       } else if (response.data instanceof Blob) {
-        // Handle Blob case
         const arrayBuffer = await response.data.arrayBuffer();
         fileBuffer = Buffer.from(arrayBuffer);
       } else {
@@ -139,13 +147,12 @@ class DriveToVoiceflowSync {
       return {
         content: fileBuffer,
         fileName: exportedFileName,
-        originalMimeType: mimeType
+        originalMimeType: finalMimeType
       };
     } catch (error) {
       console.error(`❌ Error downloading ${fileName}:`, error.message);
       if (error.response) {
         console.error(`   Status: ${error.response.status}`);
-        console.error(`   Response type: ${typeof error.response.data}`);
       }
       return null;
     }
@@ -263,13 +270,61 @@ class DriveToVoiceflowSync {
     return false;
   }
 
-  sanitizeFilename(filename) {
-    // Remove or replace problematic characters in filenames
-    return filename
-      .replace(/[<>:"/\\|?*]/g, '-') // Replace invalid characters with dash
-      .replace(/\s+/g, ' ') // Replace multiple spaces with single space
-      .replace(/^\s+|\s+$/g, '') // Trim spaces from start/end
-      .substring(0, 200); // Limit filename length
+  async getExistingVoiceflowFiles() {
+    try {
+      console.log('🔍 Fetching existing files from Voiceflow Knowledge Base...');
+      
+      const response = await axios.get(
+        `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs`,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.config.voiceflowApiKey}`
+          },
+          timeout: 30000
+        }
+      );
+
+      const existingFiles = response.data?.data || [];
+      console.log(`📚 Found ${existingFiles.length} existing files in Voiceflow Knowledge Base`);
+      
+      // Create a Set of existing filenames for quick lookup
+      const existingNames = new Set();
+      existingFiles.forEach(file => {
+        if (file.name) {
+          existingNames.add(file.name.toLowerCase());
+          // Also add sanitized version
+          const sanitized = this.sanitizeFilename(file.name).toLowerCase();
+          existingNames.add(sanitized);
+        }
+      });
+      
+      console.log(`📋 Example existing files: ${Array.from(existingNames).slice(0, 3).join(', ')}`);
+      return existingNames;
+    } catch (error) {
+      console.error('⚠️ Error fetching existing Voiceflow files:', error.message);
+      if (error.response?.status === 401) {
+        console.error('❌ Authentication failed - check your Voiceflow API key');
+      }
+      return new Set(); // Return empty set so all files get uploaded
+    }
+  }
+
+  fileAlreadyExists(fileName, existingFiles) {
+    const variations = [
+      fileName.toLowerCase(),
+      this.sanitizeFilename(fileName).toLowerCase(),
+      fileName.replace(/['"]/g, '').toLowerCase(),
+      fileName.replace(/\s*\([^)]*\)\s*/g, '').toLowerCase(),
+      fileName.replace(/\s*\[[^\]]*\]\s*/g, '').toLowerCase()
+    ];
+    
+    for (const variation of variations) {
+      if (existingFiles.has(variation)) {
+        console.log(`⚠️ File already exists (skipping): ${fileName}`);
+        return true;
+      }
+    }
+    return false;
   }
 
   async uploadToVoiceflow(fileData, originalFile) {
@@ -422,34 +477,50 @@ class DriveToVoiceflowSync {
   }
 
   async sync() {
-    console.log('🚀 Starting Google Drive to Voiceflow sync (Recent Files Only)...');
-    console.log(`📅 Sync started at: ${new Date().toISOString()}`);
+    console.log('Starting Google Drive to Voiceflow sync with duplicate checking...');
+    console.log(`Sync started at: ${new Date().toISOString()}`);
     
     try {
       // Initialize Google Drive
       await this.initializeDrive();
       
-      // Get recent files from Drive (modified in last 6 hours)
+      // Get existing files from Voiceflow first
+      const existingFiles = await this.getExistingVoiceflowFiles();
+      
+      // Get all files from Drive
       const files = await this.getFilesFromDrive();
       
       if (files.length === 0) {
-        console.log('📭 No recent files found - nothing to sync');
+        console.log('No files found in the specified folder');
         return;
       }
 
       let processedCount = 0;
       let skippedCount = 0;
       let errorCount = 0;
+      let alreadyExistsCount = 0;
 
-      // Process each recent file
+      // Process each file
       for (const file of files) {
-        console.log(`\n🔄 Processing recent file: ${file.name}`);
-        console.log(`📅 Modified: ${new Date(file.modifiedTime).toLocaleString()}`);
+        console.log(`\nProcessing: ${file.name}`);
         
         // Check if file type is supported
         if (!this.isFileSupported(file.mimeType)) {
-          console.log(`⚠️  Skipping unsupported file type: ${file.mimeType}`);
+          console.log(`Skipping unsupported file type: ${file.mimeType}`);
           skippedCount++;
+          continue;
+        }
+
+        // Determine final filename after export
+        let finalFileName = file.name;
+        if (this.isGoogleWorkspaceFile(file.mimeType)) {
+          const exportFormat = this.getExportFormat(file.mimeType);
+          finalFileName = `${file.name}.${exportFormat.extension}`;
+        }
+
+        // Check if file already exists in Voiceflow
+        if (this.fileAlreadyExists(finalFileName, existingFiles)) {
+          alreadyExistsCount++;
           continue;
         }
 
@@ -467,27 +538,39 @@ class DriveToVoiceflowSync {
             skippedCount++;
           } else {
             processedCount++;
+            // Add to existing files set to prevent duplicates in same run
+            existingFiles.add(fileData.fileName.toLowerCase());
           }
         } else {
           errorCount++;
         }
         
-        // Add small delay to avoid rate limits
+        // Add delay to avoid rate limits
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
       // Final summary
-      console.log('\n🎉 Recent files sync completed!');
-      console.log(`📊 Summary:`);
-      console.log(`   ✅ Processed: ${processedCount} files`);
-      console.log(`   ⚠️  Skipped (unsupported/too large): ${skippedCount} files`);
-      console.log(`   ❌ Errors: ${errorCount} files`);
-      console.log(`📅 Sync finished at: ${new Date().toISOString()}`);
+      console.log('\nSync completed!');
+      console.log('Summary:');
+      console.log(`   Processed: ${processedCount} files`);
+      console.log(`   Already exists: ${alreadyExistsCount} files`);
+      console.log(`   Skipped (unsupported/too large): ${skippedCount} files`);
+      console.log(`   Errors: ${errorCount} files`);
+      console.log(`Sync finished at: ${new Date().toISOString()}`);
       
     } catch (error) {
-      console.error('💥 Sync failed with error:', error.message);
+      console.error('Sync failed with error:', error.message);
       throw error;
     }
+  }
+
+  sanitizeFilename(filename) {
+    // Remove or replace problematic characters in filenames
+    return filename
+      .replace(/[<>:"/\\|?*]/g, '-') // Replace invalid characters with dash
+      .replace(/\s+/g, ' ') // Replace multiple spaces with single space
+      .replace(/^\s+|\s+$/g, '') // Trim spaces from start/end
+      .substring(0, 200); // Limit filename length
   }
 }
 
