@@ -1,0 +1,42 @@
+name: Sync Drive to Voiceflow (Python)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  sync:
+    name: Sync Files
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install Dependencies
+      run: |
+        pip install google-api-python-client google-auth requests python-docx PyPDF2
+    
+    - name: Create Service Account File
+      run: |
+        echo '${{ secrets.GOOGLE_CREDENTIALS }}' > voiceflow-service-account.json
+    
+    - name: Run Sync
+      env:
+        VOICEFLOW_API_KEY: ${{ secrets.VOICEFLOW_API_KEY }}
+        DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      run: |
+        python sync.py
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -f voiceflow-service-account.json
