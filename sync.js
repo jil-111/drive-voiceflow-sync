@@ -56,25 +56,134 @@ class DriveToVoiceflowSync {
     }
   }
 
-  async downloadFile(fileId, fileName) {
+  async downloadFile(fileId, fileName, mimeType) {
     try {
       console.log(`⬇️ Downloading: ${fileName}`);
       
-      const response = await this.drive.files.get({
-        fileId: fileId,
-        alt: 'media'
-      });
+      let response;
+      let exportedFileName = fileName;
+      
+      // Check if it's a Google Workspace file that needs to be exported
+      if (this.isGoogleWorkspaceFile(mimeType)) {
+        const exportFormat = this.getExportFormat(mimeType);
+        const exportMimeType = exportFormat.mimeType;
+        exportedFileName = `${fileName}.${exportFormat.extension}`;
+        
+        console.log(`📤 Exporting Google Workspace file: ${fileName} → ${exportedFileName}`);
+        
+        response = await this.drive.files.export({
+          fileId: fileId,
+          mimeType: exportMimeType
+        });
+        
+      } else {
+        // Regular file download
+        response = await this.drive.files.get({
+          fileId: fileId,
+          alt: 'media'
+        });
+      }
 
-      console.log(`✅ Downloaded: ${fileName} (${response.data.length} bytes)`);
+      console.log(`✅ Downloaded: ${exportedFileName} (${response.data.length || 'unknown'} bytes)`);
       
       return {
         content: response.data,
-        fileName: fileName
+        fileName: exportedFileName,
+        originalMimeType: mimeType
       };
     } catch (error) {
       console.error(`❌ Error downloading ${fileName}:`, error.message);
       return null;
     }
+  }
+
+  isGoogleWorkspaceFile(mimeType) {
+    const googleWorkspaceTypes = [
+      'application/vnd.google-apps.document',
+      'application/vnd.google-apps.spreadsheet', 
+      'application/vnd.google-apps.presentation'
+    ];
+    return googleWorkspaceTypes.includes(mimeType);
+  }
+
+  getExportFormat(mimeType) {
+    const exportFormats = {
+      'application/vnd.google-apps.document': {
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        extension: 'docx'
+      },
+      'application/vnd.google-apps.spreadsheet': {
+        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 
+        extension: 'xlsx'
+      },
+      'application/vnd.google-apps.presentation': {
+        mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        extension: 'pptx'
+      }
+    };
+    
+    return exportFormats[mimeType] || { mimeType: 'application/pdf', extension: 'pdf' };
+  }
+
+  async getExistingVoiceflowFiles() {
+    try {
+      console.log('🔍 Fetching existing files from Voiceflow Knowledge Base...');
+      
+      const response = await axios.get(
+        `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs`,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.config.voiceflowApiKey}`
+          },
+          timeout: 30000
+        }
+      );
+
+      const existingFiles = response.data?.data || [];
+      console.log(`📚 Found ${existingFiles.length} existing files in Voiceflow Knowledge Base`);
+      
+      // Create a map for quick lookup: filename -> file info
+      const fileMap = new Map();
+      existingFiles.forEach(file => {
+        if (file.name) {
+          fileMap.set(file.name.toLowerCase(), {
+            id: file.documentID,
+            name: file.name,
+            updatedAt: file.updatedAt || file.createdAt
+          });
+        }
+      });
+      
+      return fileMap;
+    } catch (error) {
+      console.error('⚠️ Error fetching existing Voiceflow files:', error.message);
+      console.log('📝 Continuing without duplicate check - all files will be uploaded');
+      return new Map(); // Return empty map so all files get uploaded
+    }
+  }
+
+  shouldUploadFile(fileName, driveModifiedTime, existingFiles) {
+    const normalizedFileName = fileName.toLowerCase();
+    const existingFile = existingFiles.get(normalizedFileName);
+    
+    if (!existingFile) {
+      console.log(`✨ New file: ${fileName}`);
+      return true;
+    }
+    
+    // Check if Drive file is newer than Voiceflow file
+    const driveTime = new Date(driveModifiedTime);
+    const voiceflowTime = new Date(existingFile.updatedAt);
+    
+    if (driveTime > voiceflowTime) {
+      console.log(`🔄 File updated since last sync: ${fileName}`);
+      console.log(`   Drive: ${driveTime.toISOString()}`);
+      console.log(`   Voiceflow: ${voiceflowTime.toISOString()}`);
+      return true;
+    }
+    
+    console.log(`⏭️ File already up-to-date: ${fileName}`);
+    return false;
   }
 
   async uploadToVoiceflow(fileData, originalFile) {
@@ -86,7 +195,7 @@ class DriveToVoiceflowSync {
       
       formData.append('file', buffer, {
         filename: fileData.fileName,
-        contentType: this.getMimeType(originalFile.mimeType)
+        contentType: this.getVoiceflowMimeType(fileData.fileName, fileData.originalMimeType)
       });
 
       const response = await axios.post(
@@ -119,18 +228,20 @@ class DriveToVoiceflowSync {
     }
   }
 
-  getMimeType(googleMimeType) {
+  getVoiceflowMimeType(fileName, originalMimeType) {
+    // Map file extensions to proper MIME types for Voiceflow
+    const extension = fileName.split('.').pop()?.toLowerCase();
+    
     const mimeTypeMap = {
-      'application/vnd.google-apps.document': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'application/vnd.google-apps.spreadsheet': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'application/vnd.google-apps.presentation': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-      'text/plain': 'text/plain',
-      'application/pdf': 'application/pdf',
-      'application/msword': 'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      'pdf': 'application/pdf',
+      'txt': 'text/plain',
+      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'doc': 'application/msword'
     };
     
-    return mimeTypeMap[googleMimeType] || 'application/octet-stream';
+    return mimeTypeMap[extension] || 'application/octet-stream';
   }
 
   isFileSupported(mimeType) {
@@ -156,6 +267,9 @@ class DriveToVoiceflowSync {
       // Initialize Google Drive
       await this.initializeDrive();
       
+      // Get existing files from Voiceflow (for duplicate checking)
+      const existingFiles = await this.getExistingVoiceflowFiles();
+      
       // Get files from Drive
       const files = await this.getFilesFromDrive();
       
@@ -167,6 +281,7 @@ class DriveToVoiceflowSync {
       let processedCount = 0;
       let skippedCount = 0;
       let errorCount = 0;
+      let duplicateCount = 0;
 
       // Process each file
       for (const file of files) {
@@ -179,8 +294,21 @@ class DriveToVoiceflowSync {
           continue;
         }
 
-        // Download file from Drive
-        const fileData = await this.downloadFile(file.id, file.name);
+        // Determine the final filename (after export if needed)
+        let finalFileName = file.name;
+        if (this.isGoogleWorkspaceFile(file.mimeType)) {
+          const exportFormat = this.getExportFormat(file.mimeType);
+          finalFileName = `${file.name}.${exportFormat.extension}`;
+        }
+
+        // Check if we need to upload this file
+        if (!this.shouldUploadFile(finalFileName, file.modifiedTime, existingFiles)) {
+          duplicateCount++;
+          continue;
+        }
+
+        // Download/Export file from Drive
+        const fileData = await this.downloadFile(file.id, file.name, file.mimeType);
         if (!fileData) {
           errorCount++;
           continue;
@@ -202,7 +330,8 @@ class DriveToVoiceflowSync {
       console.log('\n🎉 Sync completed!');
       console.log(`📊 Summary:`);
       console.log(`   ✅ Processed: ${processedCount} files`);
-      console.log(`   ⚠️  Skipped: ${skippedCount} files`);
+      console.log(`   ⏭️ Already up-to-date: ${duplicateCount} files`);
+      console.log(`   ⚠️  Skipped (unsupported): ${skippedCount} files`);
       console.log(`   ❌ Errors: ${errorCount} files`);
       console.log(`📅 Sync finished at: ${new Date().toISOString()}`);
       
