@@ -35,21 +35,47 @@ class DriveToVoiceflowSync {
     try {
       console.log('🔍 Fetching files from Google Drive...');
       
-      const response = await this.drive.files.list({
-        q: `'${this.config.googleDriveFolderId}' in parents and trashed=false`,
-        fields: 'files(id, name, mimeType, modifiedTime, size)',
-        orderBy: 'modifiedTime desc'
-      });
+      let allFiles = [];
+      let pageToken = null;
+      let pageCount = 0;
+      
+      do {
+        const params = {
+          q: `'${this.config.googleDriveFolderId}' in parents and trashed=false`,
+          fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, size)',
+          orderBy: 'modifiedTime desc',
+          pageSize: 100
+        };
+        
+        if (pageToken) {
+          params.pageToken = pageToken;
+        }
+        
+        const response = await this.drive.files.list(params);
+        const files = response.data.files || [];
+        
+        allFiles = allFiles.concat(files);
+        pageToken = response.data.nextPageToken;
+        pageCount++;
+        
+        console.log(`📄 Page ${pageCount}: Found ${files.length} files (Total so far: ${allFiles.length})`);
+        
+      } while (pageToken);
 
-      const files = response.data.files || [];
-      console.log(`📁 Found ${files.length} files in Google Drive folder`);
+      console.log(`📁 Total files found in Google Drive folder: ${allFiles.length}`);
       
-      // Log each file for debugging
-      files.forEach(file => {
-        console.log(`  📄 ${file.name} (${file.mimeType})`);
-      });
+      // Log sample files for debugging
+      if (allFiles.length > 0) {
+        console.log(`📋 Sample files:`);
+        allFiles.slice(0, 5).forEach((file, index) => {
+          console.log(`  ${index + 1}. ${file.name} (${file.mimeType})`);
+        });
+        if (allFiles.length > 5) {
+          console.log(`  ... and ${allFiles.length - 5} more files`);
+        }
+      }
       
-      return files;
+      return allFiles;
     } catch (error) {
       console.error('❌ Error fetching files from Google Drive:', error.message);
       return [];
@@ -74,25 +100,43 @@ class DriveToVoiceflowSync {
         response = await this.drive.files.export({
           fileId: fileId,
           mimeType: exportMimeType
-        });
+        }, { responseType: 'arraybuffer' }); // Explicitly request arraybuffer
         
       } else {
         // Regular file download
         response = await this.drive.files.get({
           fileId: fileId,
           alt: 'media'
-        });
+        }, { responseType: 'arraybuffer' }); // Explicitly request arraybuffer
       }
 
-      console.log(`✅ Downloaded: ${exportedFileName} (${response.data.length || 'unknown'} bytes)`);
+      // Convert to Buffer if needed
+      let fileBuffer;
+      if (Buffer.isBuffer(response.data)) {
+        fileBuffer = response.data;
+      } else if (response.data instanceof ArrayBuffer) {
+        fileBuffer = Buffer.from(response.data);
+      } else if (response.data instanceof Blob) {
+        // Handle Blob case
+        const arrayBuffer = await response.data.arrayBuffer();
+        fileBuffer = Buffer.from(arrayBuffer);
+      } else {
+        fileBuffer = Buffer.from(response.data);
+      }
+
+      console.log(`✅ Downloaded: ${exportedFileName} (${fileBuffer.length} bytes)`);
       
       return {
-        content: response.data,
+        content: fileBuffer,
         fileName: exportedFileName,
         originalMimeType: mimeType
       };
     } catch (error) {
       console.error(`❌ Error downloading ${fileName}:`, error.message);
+      if (error.response) {
+        console.error(`   Status: ${error.response.status}`);
+        console.error(`   Response type: ${typeof error.response.data}`);
+      }
       return null;
     }
   }
@@ -191,12 +235,27 @@ class DriveToVoiceflowSync {
       console.log(`📤 Uploading to Voiceflow: ${fileData.fileName}`);
       
       const formData = new FormData();
-      const buffer = Buffer.from(fileData.content);
+      
+      // Ensure we have a proper Buffer
+      let buffer;
+      if (Buffer.isBuffer(fileData.content)) {
+        buffer = fileData.content;
+      } else {
+        buffer = Buffer.from(fileData.content);
+      }
+      
+      // Validate buffer
+      if (!buffer || buffer.length === 0) {
+        throw new Error('File content is empty or invalid');
+      }
       
       formData.append('file', buffer, {
         filename: fileData.fileName,
         contentType: this.getVoiceflowMimeType(fileData.fileName, fileData.originalMimeType)
       });
+
+      console.log(`📊 File size: ${buffer.length} bytes`);
+      console.log(`📝 Content type: ${this.getVoiceflowMimeType(fileData.fileName, fileData.originalMimeType)}`);
 
       const response = await axios.post(
         `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs`,
