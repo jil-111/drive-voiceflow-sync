@@ -331,7 +331,7 @@ class DriveToVoiceflowSync {
     try {
       // Sanitize filename for better compatibility
       const sanitizedFilename = this.sanitizeFilename(fileData.fileName);
-      console.log(`📤 Uploading to Voiceflow: ${sanitizedFilename}`);
+      console.log(`Uploading to Voiceflow: ${sanitizedFilename}`);
       
       const formData = new FormData();
       
@@ -351,7 +351,7 @@ class DriveToVoiceflowSync {
       // Check file size (Voiceflow might have limits)
       const maxSize = 50 * 1024 * 1024; // 50MB limit
       if (buffer.length > maxSize) {
-        console.log(`⚠️ File too large (${buffer.length} bytes), skipping: ${sanitizedFilename}`);
+        console.log(`File too large (${buffer.length} bytes), skipping: ${sanitizedFilename}`);
         return { error: 'File too large', skipped: true };
       }
       
@@ -360,45 +360,48 @@ class DriveToVoiceflowSync {
         contentType: this.getVoiceflowMimeType(sanitizedFilename, fileData.originalMimeType)
       });
 
-      console.log(`📊 File size: ${buffer.length} bytes`);
-      console.log(`📝 Content type: ${this.getVoiceflowMimeType(sanitizedFilename, fileData.originalMimeType)}`);
+      console.log(`File size: ${buffer.length} bytes`);
+      console.log(`Content type: ${this.getVoiceflowMimeType(sanitizedFilename, fileData.originalMimeType)}`);
 
+      // Use the same endpoint as your Python script
       const response = await axios.post(
-        `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs`,
+        `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs/upload`,
         formData,
         {
           headers: {
-            'Authorization': `Bearer ${this.config.voiceflowApiKey}`,
+            'Authorization': this.config.voiceflowApiKey, // No Bearer prefix like Python
             ...formData.getHeaders()
           },
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
-          timeout: 120000, // Increased timeout to 2 minutes
+          timeout: 120000,
           validateStatus: function (status) {
             return status < 500; // Don't throw for 4xx errors, only 5xx
           }
         }
       );
 
-      if (response.status >= 400) {
-        console.error(`❌ HTTP ${response.status} error uploading ${sanitizedFilename}`);
-        console.error(`   Response: ${JSON.stringify(response.data)}`);
+      // Handle different success status codes like your Python script
+      if ([200, 201, 202].includes(response.status)) {
+        console.log(`Successfully uploaded to Voiceflow: ${sanitizedFilename}`);
+        return response.data;
+      } else if (response.status === 409) {
+        console.log(`File already exists (skipping): ${sanitizedFilename}`);
+        return { skipped: true };
+      } else {
+        console.error(`HTTP ${response.status} error uploading ${sanitizedFilename}`);
+        console.error(`Response: ${JSON.stringify(response.data)}`);
         return null;
       }
 
-      console.log(`✅ Successfully uploaded to Voiceflow: ${sanitizedFilename}`);
-      console.log(`   Document ID: ${response.data.documentID || response.data.id || 'N/A'}`);
-      
-      return response.data;
     } catch (error) {
-      console.error(`❌ Error uploading ${fileData.fileName} to Voiceflow:`);
+      console.error(`Error uploading ${fileData.fileName} to Voiceflow:`);
       
       if (error.code === 'ECONNABORTED') {
         console.error('   Error: Request timeout - file may be too large or connection is slow');
       } else if (error.response) {
         console.error(`   Status: ${error.response.status}`);
         
-        // Better error message parsing
         let errorMessage = 'Unknown error';
         if (typeof error.response.data === 'string') {
           if (error.response.data.includes('Internal Server Error')) {
@@ -411,33 +414,6 @@ class DriveToVoiceflowSync {
         }
         
         console.error(`   Message: ${errorMessage}`);
-        
-        // Specific handling for 500 errors
-        if (error.response.status === 500) {
-          console.log(`🔄 Retrying upload for ${fileData.fileName} in 5 seconds...`);
-          await new Promise(resolve => setTimeout(resolve, 5000));
-          
-          // Single retry attempt
-          try {
-            const retryResponse = await axios.post(
-              `${this.config.voiceflowApiUrl}/v1/knowledge-base/docs`,
-              formData,
-              {
-                headers: {
-                  'Authorization': `Bearer ${this.config.voiceflowApiKey}`,
-                  ...formData.getHeaders()
-                },
-                maxContentLength: Infinity,
-                maxBodyLength: Infinity,
-                timeout: 120000
-              }
-            );
-            console.log(`✅ Retry successful for: ${fileData.fileName}`);
-            return retryResponse.data;
-          } catch (retryError) {
-            console.error(`❌ Retry also failed for ${fileData.fileName}`);
-          }
-        }
       } else {
         console.error(`   Error: ${error.message}`);
       }
@@ -477,15 +453,15 @@ class DriveToVoiceflowSync {
   }
 
   async sync() {
-    console.log('Starting Google Drive to Voiceflow sync with duplicate checking...');
+    console.log('Starting Google Drive to Voiceflow sync...');
     console.log(`Sync started at: ${new Date().toISOString()}`);
     
     try {
       // Initialize Google Drive
       await this.initializeDrive();
       
-      // Get existing files from Voiceflow first
-      const existingFiles = await this.getExistingVoiceflowFiles();
+      // Skip duplicate checking for now due to API issues
+      console.log('Skipping duplicate check due to API issues - will rely on 409 responses');
       
       // Get all files from Drive
       const files = await this.getFilesFromDrive();
@@ -500,27 +476,17 @@ class DriveToVoiceflowSync {
       let errorCount = 0;
       let alreadyExistsCount = 0;
 
-      // Process each file
-      for (const file of files) {
+      // Process each file (limit to first 5 for testing)
+      const filesToProcess = files.slice(0, 5);
+      console.log(`Testing with first ${filesToProcess.length} files...`);
+
+      for (const file of filesToProcess) {
         console.log(`\nProcessing: ${file.name}`);
         
         // Check if file type is supported
         if (!this.isFileSupported(file.mimeType)) {
           console.log(`Skipping unsupported file type: ${file.mimeType}`);
           skippedCount++;
-          continue;
-        }
-
-        // Determine final filename after export
-        let finalFileName = file.name;
-        if (this.isGoogleWorkspaceFile(file.mimeType)) {
-          const exportFormat = this.getExportFormat(file.mimeType);
-          finalFileName = `${file.name}.${exportFormat.extension}`;
-        }
-
-        // Check if file already exists in Voiceflow
-        if (this.fileAlreadyExists(finalFileName, existingFiles)) {
-          alreadyExistsCount++;
           continue;
         }
 
@@ -535,18 +501,16 @@ class DriveToVoiceflowSync {
         const result = await this.uploadToVoiceflow(fileData, file);
         if (result) {
           if (result.skipped) {
-            skippedCount++;
+            alreadyExistsCount++;
           } else {
             processedCount++;
-            // Add to existing files set to prevent duplicates in same run
-            existingFiles.add(fileData.fileName.toLowerCase());
           }
         } else {
           errorCount++;
         }
         
         // Add delay to avoid rate limits
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       // Final summary
@@ -554,7 +518,7 @@ class DriveToVoiceflowSync {
       console.log('Summary:');
       console.log(`   Processed: ${processedCount} files`);
       console.log(`   Already exists: ${alreadyExistsCount} files`);
-      console.log(`   Skipped (unsupported/too large): ${skippedCount} files`);
+      console.log(`   Skipped: ${skippedCount} files`);
       console.log(`   Errors: ${errorCount} files`);
       console.log(`Sync finished at: ${new Date().toISOString()}`);
       
